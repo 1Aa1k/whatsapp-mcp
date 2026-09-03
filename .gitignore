@@ -6,3 +6,4 @@ whatsapp-bridge/qr.png
 whatsapp-bridge/store/
 whatsapp-bridge/qr_raw.txt
 whatsapp-bridge/whatsapp-bridge
+export_self_chat.py
