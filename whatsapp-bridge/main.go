@@ -24,6 +24,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -203,7 +204,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,11 +363,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
+
+	// WhatsApp never echoes a send back to the device that made it, so record
+	// it here or the bridge's own outgoing messages are missing from history.
+	storeSentMessage(client, messageStore, recipientJID, resp, message, mediaPath)
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
@@ -387,6 +392,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if vid := msg.GetVideoMessage(); vid != nil {
 		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
+	}
+
+	// Video note (round video), previously dropped
+	if ptv := msg.GetPtvMessage(); ptv != nil {
+		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+			ptv.GetURL(), ptv.GetMediaKey(), ptv.GetFileSHA256(), ptv.GetFileEncSHA256(), ptv.GetFileLength()
 	}
 
 	// Check for audio message
@@ -429,9 +440,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	if content == "" && mediaType != "" {
+		content = mediaCaption(msg.Message)
+	}
+
+	// Never drop a chat message silently: unknown types get a placeholder row
+	// and a log line naming the fields (see describe.go for the 2026-11-19 loss).
 	if content == "" && mediaType == "" {
-		return
+		desc, keep := describeNonText(msg.Message)
+		if !keep {
+			logger.Infof("Skipped non-chat message %s in %s (%s)", msg.Info.ID, chatJID, setFieldNames(msg.Message))
+			return
+		}
+		content = desc
 	}
 
 	// Store message in database
@@ -681,6 +702,8 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	registerBackfillHandler(client)
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -710,7 +733,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -829,6 +852,9 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Ask the phone to resend any message this device fails to decrypt,
+	// instead of losing it.
+	client.AutomaticMessageRerequestFromPhone = true
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -1052,13 +1078,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			// An on-demand sync returns OLDER messages; don't move the chat's
+			// last-message time backwards.
+			if historySync.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
+				messageStore.StoreChat(chatJID, name, timestamp)
+			}
 
 			// Store messages
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
 					continue
 				}
+
+				// Same unwrapping live events get (ephemeral, view-once, edits, ...)
+				msg.Message.Message = unwrapHistoryMessage(msg.Message.Message)
 
 				// Extract text content
 				var content string
@@ -1082,9 +1115,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
-				// Skip messages with no content and no media
+				if content == "" && mediaType != "" {
+					content = mediaCaption(msg.Message.Message)
+				}
 				if content == "" && mediaType == "" {
-					continue
+					desc, keep := describeNonText(msg.Message.Message)
+					if !keep {
+						continue
+					}
+					content = desc
 				}
 
 				// Determine sender
